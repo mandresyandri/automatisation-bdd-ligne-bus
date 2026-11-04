@@ -1,0 +1,10 @@
+# Configuration locale (contient le mot de passe)
+config.ini
+
+# Donnees et journaux generes
+data/
+logs/
+
+# Python
+__pycache__/
+*.pyc
