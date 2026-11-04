@@ -1,6 +1,9 @@
 ; Modele de configuration.
 ; Copier ce fichier en config.ini puis le remplir.
-; config.ini contient le mot de passe : il est exclu du depot (.gitignore).
+; config.ini peut contenir un mot de passe : il est exclu du depot (.gitignore).
+;
+; MAJ complete (CSV + ArcGIS) : python run.py
+; CSV seuls                   : python load_data.py
 
 [ODS_ACCESS]
 portal_url=https://data.seineouest.fr
@@ -11,33 +14,39 @@ sufix=/exports/csv?lang=fr&timezone=Europe/Paris&delimiter=%3B&use_labels=false
 apikey=
 
 [ARCGIS_ACCESS]
-; URL de connexion (agnostique Portal / ArcGIS Online) :
+; auth=pro     : utilise la session ArcGIS Pro (connecte au portail, "Me connecter automatiquement")
+;                -> rien a saisir, ideal pour la tache planifiee. Defaut si username est vide.
+; auth=builtin : username + password ci-dessous (ou variable d'environnement ARCGIS_PASSWORD)
+auth=pro
+; URL du portail (utilisee en auth=builtin) :
 ;   ArcGIS Online : https://<org>.maps.arcgis.com/
 ;   Portal        : https://<serveur>/portal
 url=https://atlas-sig.seineouest.fr/portal/
 username=
-; vide = lu dans la variable d'environnement ARCGIS_PASSWORD, sinon demande au lancement
 password=
 ; false si le certificat du portail n'est pas reconnu par Python
 verify_cert=true
-; dossier de contenu du portail ou ranger les elements
+; dossier de contenu du portail ou ranger les tables
 folder=Hyperviseur_bus
 ; partage des tables : everyone | org | private
 sharing=everyone
 tags=GPSO,bus,hyperviseur,opendata
 
-; Une section DATASET_<NOM> par jeu ODS a publier.
-; layer_url est rempli automatiquement par bootstrap.py apres publication
-; (URL de la table : .../FeatureServer/<index>). Rempli = deja publie, bootstrap le saute.
+; Une section DATASET_<NOM> par jeu ODS.
+; layer_url est rempli automatiquement par run.py a la creation de la table
+; (.../FeatureServer/<index>). Ne pas le modifier ensuite : c'est la table lue par l'hyperviseur.
+; Facultatif : min_year (2019 par defaut), id_field, year_field, value_field (voir load_data.py).
 
 [DATASET_FREQUENTATION]
 data_name=frequentation-des-lignes-de-bus-locaux-depuis-2014
 service_name=bus_frequentation_lignes
 title=Frequentation des lignes de bus locaux depuis 2014
+min_year=2019
 layer_url=
 
 [DATASET_TAUX_REALISATION]
 data_name=taux-de-realisation-des-lignes-de-bus-locaux-depuis-2014
 service_name=bus_taux_realisation_lignes
 title=Taux de realisation des lignes de bus locaux depuis 2014
+min_year=2019
 layer_url=
