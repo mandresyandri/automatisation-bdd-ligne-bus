@@ -18,7 +18,7 @@ class Dataset:
     data_name: str     # identifiant du jeu sur ODS
     service_name: str  # nom du service / du fichier local
     title: str         # titre de l'element sur le portail
-    layer_url: str     # vide tant que la table n'est pas publiee
+    layer_url: str     # vide tant que la table n'est pas creee (rempli par run.py)
 
 
 def read_config(path: Path = CONFIG_FILE) -> configparser.ConfigParser:
@@ -67,23 +67,36 @@ def ods_urls(cfg: configparser.ConfigParser, data_name: str) -> tuple[str, str]:
 
 
 def arcgis_settings(cfg: configparser.ConfigParser) -> dict:
-    """Parametres ArcGIS. Mot de passe : config.ini, sinon ARCGIS_PASSWORD, sinon saisie."""
+    """Parametres ArcGIS.
+
+    auth=pro     : session ArcGIS Pro active (aucun identifiant, aucune saisie) ;
+                   valeur par defaut quand username est vide.
+    auth=builtin : username + mot de passe (config.ini, sinon ARCGIS_PASSWORD, sinon saisie).
+    """
     s = cfg["ARCGIS_ACCESS"]
-    username = s.get("username", "").strip() or input("Utilisateur portail : ").strip()
-    password = (
-        s.get("password", "").strip()
-        or os.environ.get("ARCGIS_PASSWORD", "")
-        or getpass.getpass(f"Mot de passe de {username} : ")
-    )
-    return {
-        "url": s["url"].strip(),
-        "username": username,
-        "password": password,
+    username = s.get("username", "").strip()
+    auth = s.get("auth", "").strip().lower() or ("builtin" if username else "pro")
+    settings = {
+        "auth": auth,
+        "url": s.get("url", "").strip(),
+        "username": "",
+        "password": "",
         "verify_cert": s.getboolean("verify_cert", fallback=True),
         "folder": s.get("folder", "Hyperviseur_bus").strip(),
         "sharing": s.get("sharing", "everyone").strip().lower(),
         "tags": s.get("tags", "GPSO,bus").strip(),
     }
+    if auth == "pro":
+        return settings
+    if not username:
+        raise ValueError("auth=builtin mais username vide dans config.ini (ou mettre auth=pro)")
+    settings["username"] = username
+    settings["password"] = (
+        s.get("password", "").strip()
+        or os.environ.get("ARCGIS_PASSWORD", "")
+        or getpass.getpass(f"Mot de passe de {username} : ")
+    )
+    return settings
 
 
 def set_config_value(section: str, key: str, value: str, path: Path = CONFIG_FILE) -> None:
