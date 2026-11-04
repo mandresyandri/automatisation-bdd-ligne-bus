@@ -6,12 +6,13 @@ load_data.py - ODS -> CSV brut -> CSV transforme. Rien d'autre.
 Pour chaque section DATASET_... de config.ini :
   1. telecharge l'export CSV depuis data.seineouest.fr ;
   2. data/raw/<service_name>.csv       : fichier ODS tel quel (iso source) ;
-  3. data/processed/<service_name>.csv : annees en lignes, lignes de bus en colonnes
-        annee;469;ChavilBus;SUBB;TIM;...
-        2019;0.9894;0.9985;0.9842;...
+  3. data/processed/<service_name>.csv : les colonnes annees passent en lignes
+        annee;ligne;valeur
+        2019;469;0.9894
+        2019;ChavilBus;0.9985
+        ...
 
-Annees de min_year (2019 par defaut) a la derniere annee renseignee : une nouvelle
-annee ODS = une nouvelle ligne, sans rien modifier.
+Annees >= min_year (2019 par defaut). Les cases vides de la source sont ignorees.
 """
 from __future__ import annotations
 
@@ -52,38 +53,31 @@ def year_of(col) -> int | None:
 
 
 def transform(df: pd.DataFrame, sec) -> pd.DataFrame:
+    """Colonnes annees -> lignes : annee;ligne;valeur."""
     id_field = sec.get("id_field", fallback="ligne").strip()
     min_year = sec.getint("min_year", fallback=2019)
+    if id_field not in df.columns:
+        raise ValueError(f"colonne '{id_field}' absente (colonnes : {list(df.columns)}) : renseigner id_field")
 
-    # format commun ligne / annee / valeur, que les annees soient en colonnes ou deja en lignes
     year_cols = {c: year_of(c) for c in df.columns if c != id_field and year_of(c)}
-    if year_cols:
-        long = df.melt(id_vars=[id_field], value_vars=list(year_cols), var_name="annee", value_name="valeur")
-        long["annee"] = long["annee"].map(year_cols)
-    else:
-        year_field = sec.get("year_field", fallback="annee").strip()
-        value_field = sec.get("value_field", fallback="").strip() or next(
-            c for c in df.columns if c not in (id_field, year_field))
-        long = df[[id_field, year_field, value_field]].copy()
-        long.columns = [id_field, "annee", "valeur"]
-        long["annee"] = long["annee"].astype(str).str.extract(r"((?:19|20)\d{2})", expand=False)
+    if not year_cols:
+        raise ValueError(f"aucune colonne annee trouvee (colonnes : {list(df.columns)})")
 
-    long["annee"] = pd.to_numeric(long["annee"], errors="coerce")
+    long = df.melt(id_vars=[id_field], value_vars=list(year_cols), var_name="annee", value_name="valeur")
+    long["annee"] = long["annee"].map(year_cols)
+    long["ligne"] = long[id_field].astype(str).str.strip()
     long["valeur"] = pd.to_numeric(
         long["valeur"].astype(str).str.replace(r"[\s\u00a0]", "", regex=True).str.replace(",", "."),
         errors="coerce")
-    long = long.dropna(subset=["annee", "valeur"])
-    long = long[long["annee"] >= min_year].astype({"annee": int})
 
-    order = list(dict.fromkeys(long[id_field].astype(str).str.strip()))
-    long[id_field] = long[id_field].astype(str).str.strip()
-    wide = long.pivot(index="annee", columns=id_field, values="valeur").sort_index()
-    wide = wide[order].dropna(how="all").dropna(axis=1, how="all")
-    for c in wide.columns:                                   # 794187.0 -> 794187
-        if (wide[c].dropna() % 1 == 0).all():
-            wide[c] = wide[c].astype("Int64")
-    wide.columns.name = None
-    return wide.reset_index()
+    long = long.dropna(subset=["valeur"])
+    long = long[long["annee"] >= min_year]
+    if (long["valeur"] % 1 == 0).all():                     # 794187.0 -> 794187
+        long["valeur"] = long["valeur"].astype("Int64")
+
+    order = {l: i for i, l in enumerate(dict.fromkeys(long["ligne"]))}   # ordre de la source
+    long = long.assign(_o=long["ligne"].map(order)).sort_values(["annee", "_o"])
+    return long[["annee", "ligne", "valeur"]].reset_index(drop=True)
 
 
 def main() -> int:
@@ -106,8 +100,8 @@ def main() -> int:
             out_path = PROCESSED_DIR / f"{ds.service_name}.csv"
             out.to_csv(out_path, sep=";", index=False, encoding="utf-8-sig")
 
-            log.info("%s : %s -> %s (%d annees, %d lignes de bus)",
-                     ds.service_name, raw_path.name, out_path, len(out), out.shape[1] - 1)
+            log.info("%s : %s -> %s (%d lignes, annees %d-%d)", ds.service_name, raw_path.name,
+                     out_path, len(out), out["annee"].min(), out["annee"].max())
         except Exception:
             failures += 1
             log.exception("Echec de %s (%s)", ds.key, ds.data_name)
