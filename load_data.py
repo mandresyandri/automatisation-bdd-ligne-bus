@@ -6,12 +6,14 @@ load_data.py - ODS -> CSV brut -> CSV transforme. Rien d'autre.
 Pour chaque section DATASET_... de config.ini :
   1. telecharge l'export CSV depuis data.seineouest.fr ;
   2. data/raw/<service_name>.csv       : fichier ODS tel quel (iso source) ;
-  3. data/processed/<service_name>.csv : les colonnes annees passent en lignes
+  3. data/processed/<service_name>.csv : format
         annee;ligne;valeur
         2019;469;0.9894
         2019;ChavilBus;0.9985
         ...
 
+Source avec des colonnes annees (2019, 2020...) -> passees en lignes.
+Source deja en lignes (ligne;annee;<chiffre>) -> simplement remise au meme format.
 Annees >= min_year (2019 par defaut). Les cases vides de la source sont ignorees.
 """
 from __future__ import annotations
@@ -53,25 +55,37 @@ def year_of(col) -> int | None:
 
 
 def transform(df: pd.DataFrame, sec) -> pd.DataFrame:
-    """Colonnes annees -> lignes : annee;ligne;valeur."""
+    """-> annee;ligne;valeur."""
     id_field = sec.get("id_field", fallback="ligne").strip()
+    year_field = sec.get("year_field", fallback="annee").strip()
     min_year = sec.getint("min_year", fallback=2019)
     if id_field not in df.columns:
         raise ValueError(f"colonne '{id_field}' absente (colonnes : {list(df.columns)}) : renseigner id_field")
 
     year_cols = {c: year_of(c) for c in df.columns if c != id_field and year_of(c)}
-    if not year_cols:
-        raise ValueError(f"aucune colonne annee trouvee (colonnes : {list(df.columns)})")
+    if year_cols:
+        # annees en colonnes -> en lignes
+        long = df.melt(id_vars=[id_field], value_vars=list(year_cols), var_name="annee", value_name="valeur")
+        long["annee"] = long["annee"].map(year_cols)
+    elif year_field in df.columns:
+        # deja en lignes : ligne;annee;<chiffre>
+        value_field = sec.get("value_field", fallback="").strip() or next(
+            c for c in df.columns if c not in (id_field, year_field))
+        long = df[[id_field, year_field, value_field]].copy()
+        long.columns = [id_field, "annee", "valeur"]
+        long["annee"] = pd.to_numeric(
+            long["annee"].astype(str).str.extract(r"((?:19|20)\d{2})", expand=False), errors="coerce")
+    else:
+        raise ValueError(f"ni colonnes annees ni colonne '{year_field}' (colonnes : {list(df.columns)})")
 
-    long = df.melt(id_vars=[id_field], value_vars=list(year_cols), var_name="annee", value_name="valeur")
-    long["annee"] = long["annee"].map(year_cols)
     long["ligne"] = long[id_field].astype(str).str.strip()
     long["valeur"] = pd.to_numeric(
         long["valeur"].astype(str).str.replace(r"[\s\u00a0]", "", regex=True).str.replace(",", "."),
         errors="coerce")
 
-    long = long.dropna(subset=["valeur"])
+    long = long.dropna(subset=["annee", "valeur"])
     long = long[long["annee"] >= min_year]
+    long["annee"] = long["annee"].astype(int)
     if (long["valeur"] % 1 == 0).all():                     # 794187.0 -> 794187
         long["valeur"] = long["valeur"].astype("Int64")
 
