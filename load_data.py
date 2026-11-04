@@ -9,20 +9,23 @@ Usage (Python d'ArcGIS Pro) :
 
 Pour chaque section DATASET_... de config.ini :
   1. lit les metadonnees ODS (titre, date de modification, nombre de lignes, champs) ;
-  2. saute le jeu si la date de modification ODS n'a pas change depuis le dernier chargement ;
-  3. telecharge l'export CSV ;
-  4. controle le fichier (non vide, colonnes attendues, nombre de lignes) ;
-  5. si le jeu a une colonne par annee (ex. taux de realisation : 2014, 2015, ...),
-     le remet au format long ligne / annee / valeur, comme la frequentation.
-     Les valeurs ne sont pas modifiees, les vides sont conserves ;
-  6. ecrit :
-       data/raw/<service_name>.csv      le CSV pret a publier
-       data/schema/<service_name>.json  les champs et leur type Esri
-       data/manifest.json               l'etat du dernier chargement
+  2. telecharge l'export CSV si la date de modification ODS a change (ou --force)
+     et l'ecrit tel quel dans data/raw/<service_name>.csv ;
+  3. traite le CSV brut (toujours, meme si ODS n'a pas change) :
+       - une ligne par ligne de bus, une colonne par annee (annee_2019, annee_2020, ...),
+         que la source soit en lignes (ligne / annee / valeur) ou deja en colonnes ;
+       - ne garde que les valeurs renseignees ;
+       - annees de min_year (2019 par defaut) a la derniere annee qui a une valeur ;
+       - supprime les lignes de bus sans aucune valeur sur la periode ;
+     et l'ecrit dans data/processed/<service_name>.csv (c'est ce fichier qui est publie) ;
+  4. ecrit data/schema/<service_name>.json (champs du fichier traite et type Esri)
+     et data/manifest.json (etat du dernier chargement).
 
-Nom de la colonne valeur apres passage en format long : cle value_name de la
-section DATASET_..., sinon deduit du service_name
-(bus_taux_realisation_lignes -> taux_realisation).
+Cles facultatives d'une section DATASET_... :
+    min_year     = 2019      premiere annee gardee
+    year_prefix  = annee_    prefixe des colonnes annee (un champ Esri ne peut pas commencer par un chiffre)
+    year_field   = annee     source en lignes : colonne de l'annee
+    value_field  =           source en lignes : colonne de la valeur (deduite si une seule colonne numerique)
 """
 from __future__ import annotations
 
@@ -43,10 +46,12 @@ from src.get_configs import ROOT, Dataset, get_datasets, ods_urls, read_config
 from src.logger import get_logger
 
 RAW_DIR = ROOT / "data" / "raw"
+PROCESSED_DIR = ROOT / "data" / "processed"
 SCHEMA_DIR = ROOT / "data" / "schema"
 MANIFEST = ROOT / "data" / "manifest.json"
 
-YEAR_COL = re.compile(r"^(19|20)\d{2}$")
+# Colonne "annee" d'un jeu deja en colonnes : nom qui finit par une annee (2019, _2019, an_2019...)
+YEAR_IN_NAME = re.compile(r"(?:^|[^0-9])((?:19|20)\d{2})$")
 
 # Types ODS -> types de champs Esri (pour la publication)
 ODS_TO_ESRI = {
@@ -86,14 +91,21 @@ def save_manifest(manifest: dict) -> None:
     MANIFEST.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def value_name_for(cfg, ds: Dataset) -> str:
-    """Nom de la colonne valeur en format long."""
-    explicit = cfg[ds.key].get("value_name", "").strip()
-    if explicit:
-        return explicit
-    name = re.sub(r"^bus_", "", ds.service_name)
-    name = re.sub(r"_lignes?$", "", name)
-    return name or "valeur"
+def read_ods_csv(content: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(content), sep=";", encoding="utf-8-sig")
+
+
+def year_of(col) -> int | None:
+    m = YEAR_IN_NAME.search(str(col))
+    return int(m.group(1)) if m else None
+
+
+def to_number(s: pd.Series) -> pd.Series:
+    """Valeurs numeriques ; accepte la virgule decimale et les espaces. Vide -> NaN."""
+    if not pd.api.types.is_numeric_dtype(s):
+        s = s.astype(str).str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False)
+        s = s.str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
 
 
 # --- Etapes -------------------------------------------------------------------
@@ -117,10 +129,10 @@ def fetch_metadata(meta_url: str) -> dict:
 
 
 def check_csv(content: bytes, meta: dict) -> pd.DataFrame:
-    """Controles simples sur le CSV recu."""
+    """Controles simples sur le CSV recu d'ODS."""
     if not content.strip():
         raise ValueError("export CSV vide")
-    df = pd.read_csv(io.BytesIO(content), sep=";", encoding="utf-8-sig")
+    df = read_ods_csv(content)
     if df.empty:
         raise ValueError("le CSV ne contient aucune ligne")
 
@@ -133,58 +145,110 @@ def check_csv(content: bytes, meta: dict) -> pd.DataFrame:
     return df
 
 
-def to_long(df: pd.DataFrame, fields: list[dict], value_name: str) -> tuple[pd.DataFrame, list[dict]]:
-    """Une colonne par annee -> une ligne par (ligne, annee). Sans effet si pas de colonne annee."""
-    year_cols = [c for c in df.columns if YEAR_COL.match(str(c))]
-    if not year_cols:
-        return df, fields
+def to_wide(df: pd.DataFrame, sec, service: str) -> tuple[pd.DataFrame, list[str]]:
+    """Une ligne par ligne de bus, une colonne par annee, de min_year a la derniere annee renseignee."""
+    min_year = sec.getint("min_year", fallback=2019)
+    prefix = sec.get("year_prefix", fallback="annee_").strip()
 
-    id_cols = [c for c in df.columns if c not in year_cols]
-    long = df.melt(id_vars=id_cols, value_vars=year_cols, var_name="annee", value_name=value_name)
-    long["annee"] = long["annee"].astype(int)
-    long = long.sort_values(id_cols + ["annee"]).reset_index(drop=True)
+    year_cols = {c: year_of(c) for c in df.columns if year_of(c) is not None}
+    if year_cols:
+        # Source deja en colonnes (ex. taux de realisation) : on repasse par le format long pour filtrer
+        id_cols = [c for c in df.columns if c not in year_cols]
+        long = df.melt(id_vars=id_cols, value_vars=list(year_cols), var_name="_col", value_name="_val")
+        long["_annee"] = long["_col"].map(year_cols)
+        long = long.drop(columns="_col")
+    else:
+        # Source en lignes (ex. frequentation : ligne / annee / nombre_de_voyages)
+        year_field = sec.get("year_field", fallback="annee").strip()
+        if year_field not in df.columns:
+            raise ValueError(f"colonne annee '{year_field}' absente (colonnes : {list(df.columns)}) : renseigner year_field")
+        value_field = sec.get("value_field", fallback="").strip()
+        if not value_field:
+            nums = [c for c in df.columns if c != year_field and to_number(df[c]).notna().any()]
+            if len(nums) != 1:
+                raise ValueError(f"colonne valeur ambigue {nums} : renseigner value_field dans config.ini")
+            value_field = nums[0]
+        id_cols = [c for c in df.columns if c not in (year_field, value_field)]
+        long = df.rename(columns={year_field: "_annee", value_field: "_val"})
 
-    by_name = {f["name"]: f for f in fields}
-    new_fields = [by_name.get(c, {"name": c, "label": c, "type": "text", "esri_type": "esriFieldTypeString"}) for c in id_cols]
-    new_fields += [
-        {"name": "annee", "label": "Annee", "type": "int", "esri_type": "esriFieldTypeInteger"},
-        {"name": value_name, "label": value_name, "type": "double", "esri_type": "esriFieldTypeDouble"},
-    ]
+    if not id_cols:
+        raise ValueError("aucune colonne d'identifiant (ligne) trouvee")
 
-    expected = len(df) * len(year_cols)
-    if len(long) != expected:
-        raise ValueError(f"format long : {len(long)} lignes au lieu de {expected}")
-    log.info("Passage en format long : %d lignes x %d annees (%s-%s) -> %d lignes, colonnes %s",
-             len(df), len(year_cols), year_cols[0], year_cols[-1], len(long), list(long.columns))
-    return long, new_fields
+    long["_val"] = to_number(long["_val"])
+    long["_annee"] = pd.to_numeric(long["_annee"], errors="coerce")
+    long = long.dropna(subset=["_val", "_annee"])               # que les valeurs renseignees
+    long["_annee"] = long["_annee"].astype(int)
+    long = long[long["_annee"] >= min_year]
+    if long.empty:
+        raise ValueError(f"aucune valeur renseignee a partir de {min_year}")
+
+    dup = long.duplicated(subset=id_cols + ["_annee"], keep=False)
+    if dup.any():
+        raise ValueError(f"plusieurs valeurs pour une meme ligne et une meme annee :\n{long[dup].head(10)}")
+
+    first, last = int(long["_annee"].min()), int(long["_annee"].max())
+    wide = long.pivot(index=id_cols, columns="_annee", values="_val")
+    wide = wide.reindex(columns=range(first, last + 1))          # annees continues, de first a last
+    wide.columns = [f"{prefix}{y}" for y in wide.columns]
+    year_names = list(wide.columns)
+    wide = wide.reset_index()
+
+    for c in year_names:                                        # 794187.0 -> 794187
+        vals = wide[c].dropna()
+        if not vals.empty and (vals % 1 == 0).all():
+            wide[c] = wide[c].astype("Int64")
+
+    kept = set(map(tuple, wide[id_cols].astype(str).values))
+    dropped = sorted(set(map(tuple, df[id_cols].astype(str).values)) - kept)
+    log.info("%s : %d lignes de bus x %d annees (%d-%d)", service, len(wide), len(year_names), first, last)
+    if dropped:
+        log.info("%s : ecartees (aucune valeur depuis %d) : %s", service, min_year, [" / ".join(d) for d in dropped])
+    empty = int(wide[year_names].isna().sum().sum())
+    if empty:
+        log.info("%s : %d case(s) vide(s) restante(s) (pas de valeur ODS pour cette ligne et cette annee)", service, empty)
+    return wide, year_names
 
 
-def describe(service: str, df: pd.DataFrame) -> None:
-    """Apercu des colonnes dans le journal, pour fixer le schema."""
-    log.info("%s : %d lignes x %d colonnes", service, len(df), len(df.columns))
-    for col in df.columns:
-        sample = df[col].dropna().unique()[:5].tolist()
-        log.info("   - %-30s %-8s %4d valeurs distinctes, ex. %s", col, str(df[col].dtype), df[col].nunique(), sample)
+def schema_fields(wide: pd.DataFrame, year_names: list[str], ods_fields: list[dict]) -> list[dict]:
+    by_name = {f["name"]: f for f in ods_fields}
+    fields = []
+    for c in wide.columns:
+        if c in year_names:
+            is_int = str(wide[c].dtype) == "Int64"
+            fields.append({
+                "name": c, "label": c.replace("_", " ").capitalize(),
+                "type": "int" if is_int else "double",
+                "esri_type": "esriFieldTypeInteger" if is_int else "esriFieldTypeDouble",
+            })
+        else:
+            fields.append(by_name.get(c, {"name": c, "label": c, "type": "text", "esri_type": "esriFieldTypeString"}))
+    return fields
 
 
 def load_dataset(cfg, ds: Dataset, manifest: dict, force: bool) -> Path:
     meta_url, export_url = ods_urls(cfg, ds.data_name)
     meta = fetch_metadata(meta_url)
     previous = manifest.get(ds.data_name, {})
-    csv_path = RAW_DIR / f"{ds.service_name}.csv"
+    raw_path = RAW_DIR / f"{ds.service_name}.csv"
+    out_path = PROCESSED_DIR / f"{ds.service_name}.csv"
 
-    if not force and csv_path.exists() and previous.get("ods_modified") == meta["modified"]:
-        log.info("%s : inchange sur ODS depuis %s, rien a faire.", ds.service_name, meta["modified"])
-        return csv_path
+    # 1. Brut : ODS tel quel
+    if not force and raw_path.exists() and previous.get("ods_modified") == meta["modified"]:
+        log.info("%s : inchange sur ODS depuis %s, brut conserve.", ds.service_name, meta["modified"])
+        content = raw_path.read_bytes()
+        raw = read_ods_csv(content)
+    else:
+        content = http_get(export_url, timeout=300).content
+        raw = check_csv(content, meta)
+        raw_path.write_bytes(content)
+        log.info("%s : brut ecrit dans %s (%d lignes)", ds.service_name, raw_path, len(raw))
 
-    content = http_get(export_url, timeout=300).content
-    df = check_csv(content, meta)
-    ods_rows = len(df)
-    df, fields = to_long(df, meta["fields"], value_name_for(cfg, ds))
-    describe(ds.service_name, df)
+    # 2. Traite : une colonne par annee, filtre
+    wide, year_names = to_wide(raw, cfg[ds.key], ds.service_name)
+    out = wide.to_csv(sep=";", index=False).encode("utf-8")
+    out_path.write_bytes(out)
 
-    out = df.to_csv(sep=";", index=False).encode("utf-8")
-    csv_path.write_bytes(out)
+    fields = schema_fields(wide, year_names, meta["fields"])
     (SCHEMA_DIR / f"{ds.service_name}.json").write_text(
         json.dumps({"data_name": ds.data_name, "title": meta["title"], "fields": fields}, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -193,20 +257,22 @@ def load_dataset(cfg, ds: Dataset, manifest: dict, force: bool) -> Path:
         "service": ds.service_name,
         "title": meta["title"],
         "ods_modified": meta["modified"],
-        "ods_records": ods_rows,
-        "records": len(df),
-        "columns": list(df.columns),
+        "raw_file": str(raw_path.relative_to(ROOT)),
+        "raw_records": len(raw),
+        "raw_sha256": hashlib.sha256(content).hexdigest(),
+        "file": str(out_path.relative_to(ROOT)),
+        "records": len(wide),
+        "columns": list(wide.columns),
         "sha256": hashlib.sha256(out).hexdigest(),
-        "file": str(csv_path.relative_to(ROOT)),
         "loaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    log.info("%s : ecrit dans %s", ds.service_name, csv_path)
-    return csv_path
+    log.info("%s : traite ecrit dans %s, colonnes %s", ds.service_name, out_path, list(wide.columns))
+    return out_path
 
 
 def load_all(cfg, force: bool = False) -> dict[str, Path]:
-    """Charge tous les jeux de config.ini. Renvoie {section: chemin du CSV} pour ceux qui ont reussi."""
-    for d in (RAW_DIR, SCHEMA_DIR):
+    """Charge tous les jeux de config.ini. Renvoie {section: chemin du CSV traite} pour ceux qui ont reussi."""
+    for d in (RAW_DIR, PROCESSED_DIR, SCHEMA_DIR):
         d.mkdir(parents=True, exist_ok=True)
     manifest = load_manifest()
     paths = {}
