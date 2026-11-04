@@ -2,7 +2,6 @@
 load_data.py - Chargement des jeux "lignes de bus locaux" depuis data.seineouest.fr.
 
 Tous les parametres (URL ODS, cle API, jeux a charger) sont dans config.ini.
-Aucune transformation : les donnees sont recuperees telles que publiees sur ODS.
 
 Usage (Python d'ArcGIS Pro) :
     python load_data.py            # ne retelecharge que les jeux modifies sur ODS
@@ -13,10 +12,17 @@ Pour chaque section DATASET_... de config.ini :
   2. saute le jeu si la date de modification ODS n'a pas change depuis le dernier chargement ;
   3. telecharge l'export CSV ;
   4. controle le fichier (non vide, colonnes attendues, nombre de lignes) ;
-  5. ecrit :
-       data/raw/<service_name>.csv      le CSV tel que recu d'ODS
-       data/schema/<service_name>.json  les champs ODS et le type Esri correspondant
+  5. si le jeu a une colonne par annee (ex. taux de realisation : 2014, 2015, ...),
+     le remet au format long ligne / annee / valeur, comme la frequentation.
+     Les valeurs ne sont pas modifiees, les vides sont conserves ;
+  6. ecrit :
+       data/raw/<service_name>.csv      le CSV pret a publier
+       data/schema/<service_name>.json  les champs et leur type Esri
        data/manifest.json               l'etat du dernier chargement
+
+Nom de la colonne valeur apres passage en format long : cle value_name de la
+section DATASET_..., sinon deduit du service_name
+(bus_taux_realisation_lignes -> taux_realisation).
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ import argparse
 import hashlib
 import io
 import json
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -38,6 +45,8 @@ from src.logger import get_logger
 RAW_DIR = ROOT / "data" / "raw"
 SCHEMA_DIR = ROOT / "data" / "schema"
 MANIFEST = ROOT / "data" / "manifest.json"
+
+YEAR_COL = re.compile(r"^(19|20)\d{2}$")
 
 # Types ODS -> types de champs Esri (pour la publication)
 ODS_TO_ESRI = {
@@ -77,6 +86,16 @@ def save_manifest(manifest: dict) -> None:
     MANIFEST.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def value_name_for(cfg, ds: Dataset) -> str:
+    """Nom de la colonne valeur en format long."""
+    explicit = cfg[ds.key].get("value_name", "").strip()
+    if explicit:
+        return explicit
+    name = re.sub(r"^bus_", "", ds.service_name)
+    name = re.sub(r"_lignes?$", "", name)
+    return name or "valeur"
+
+
 # --- Etapes -------------------------------------------------------------------
 def fetch_metadata(meta_url: str) -> dict:
     meta = http_get(meta_url).json()
@@ -98,7 +117,7 @@ def fetch_metadata(meta_url: str) -> dict:
 
 
 def check_csv(content: bytes, meta: dict) -> pd.DataFrame:
-    """Controles simples, sans rien modifier au fichier."""
+    """Controles simples sur le CSV recu."""
     if not content.strip():
         raise ValueError("export CSV vide")
     df = pd.read_csv(io.BytesIO(content), sep=";", encoding="utf-8-sig")
@@ -112,6 +131,32 @@ def check_csv(content: bytes, meta: dict) -> pd.DataFrame:
     if meta["records_count"] is not None and len(df) != meta["records_count"]:
         log.warning("Nombre de lignes : %d dans le CSV, %d annonce par ODS", len(df), meta["records_count"])
     return df
+
+
+def to_long(df: pd.DataFrame, fields: list[dict], value_name: str) -> tuple[pd.DataFrame, list[dict]]:
+    """Une colonne par annee -> une ligne par (ligne, annee). Sans effet si pas de colonne annee."""
+    year_cols = [c for c in df.columns if YEAR_COL.match(str(c))]
+    if not year_cols:
+        return df, fields
+
+    id_cols = [c for c in df.columns if c not in year_cols]
+    long = df.melt(id_vars=id_cols, value_vars=year_cols, var_name="annee", value_name=value_name)
+    long["annee"] = long["annee"].astype(int)
+    long = long.sort_values(id_cols + ["annee"]).reset_index(drop=True)
+
+    by_name = {f["name"]: f for f in fields}
+    new_fields = [by_name.get(c, {"name": c, "label": c, "type": "text", "esri_type": "esriFieldTypeString"}) for c in id_cols]
+    new_fields += [
+        {"name": "annee", "label": "Annee", "type": "int", "esri_type": "esriFieldTypeInteger"},
+        {"name": value_name, "label": value_name, "type": "double", "esri_type": "esriFieldTypeDouble"},
+    ]
+
+    expected = len(df) * len(year_cols)
+    if len(long) != expected:
+        raise ValueError(f"format long : {len(long)} lignes au lieu de {expected}")
+    log.info("Passage en format long : %d lignes x %d annees (%s-%s) -> %d lignes, colonnes %s",
+             len(df), len(year_cols), year_cols[0], year_cols[-1], len(long), list(long.columns))
+    return long, new_fields
 
 
 def describe(service: str, df: pd.DataFrame) -> None:
@@ -134,20 +179,24 @@ def load_dataset(cfg, ds: Dataset, manifest: dict, force: bool) -> Path:
 
     content = http_get(export_url, timeout=300).content
     df = check_csv(content, meta)
+    ods_rows = len(df)
+    df, fields = to_long(df, meta["fields"], value_name_for(cfg, ds))
     describe(ds.service_name, df)
 
-    csv_path.write_bytes(content)
+    out = df.to_csv(sep=";", index=False).encode("utf-8")
+    csv_path.write_bytes(out)
     (SCHEMA_DIR / f"{ds.service_name}.json").write_text(
-        json.dumps({"data_name": ds.data_name, "title": meta["title"], "fields": meta["fields"]}, indent=2, ensure_ascii=False),
+        json.dumps({"data_name": ds.data_name, "title": meta["title"], "fields": fields}, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     manifest[ds.data_name] = {
         "service": ds.service_name,
         "title": meta["title"],
         "ods_modified": meta["modified"],
+        "ods_records": ods_rows,
         "records": len(df),
         "columns": list(df.columns),
-        "sha256": hashlib.sha256(content).hexdigest(),
+        "sha256": hashlib.sha256(out).hexdigest(),
         "file": str(csv_path.relative_to(ROOT)),
         "loaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
