@@ -1,7 +1,7 @@
 """
 load_data.py - Genere les CSV "lignes de bus locaux" depuis data.seineouest.fr.
 
-AUCUNE connexion au portail ArcGIS : ce script ne fait que produire des CSV.
+AUCUNE connexion au portail ArcGIS ici (CSV seuls). Pour CSV + MAJ ArcGIS : python run.py
 
 Usage (Python d'ArcGIS Pro) :
     python load_data.py
@@ -132,23 +132,24 @@ def transpose(long: pd.DataFrame, min_year: int, name: str) -> pd.DataFrame:
     return wide.reset_index()
 
 
-def main() -> int:
-    cfg = read_config()
+def build_all(cfg) -> dict[str, pd.DataFrame]:
+    """Telecharge et regenere les CSV de tous les jeux. Renvoie {section: tableau traite}.
+    Un jeu en echec est absent du resultat (son ancien CSV n'est pas ecrase)."""
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    manifest, failures = {}, 0
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8")) if MANIFEST.exists() else {}
+    built: dict[str, pd.DataFrame] = {}
 
     for ds in get_datasets(cfg):
         try:
             _, export_url = ods_urls(cfg, ds.data_name)
             content = http_get(export_url).content
-            raw_path = RAW_DIR / f"{ds.service_name}.csv"
-            raw_path.write_bytes(content)
             raw = pd.read_csv(io.BytesIO(content), sep=";", encoding="utf-8-sig", dtype=str)
-            log.info("%s : brut -> %s (%d lignes)", ds.service_name, raw_path, len(raw))
-
             sec = cfg[ds.key]
             wide = transpose(to_long(raw, sec), sec.getint("min_year", fallback=2019), ds.service_name)
+
+            raw_path = RAW_DIR / f"{ds.service_name}.csv"
+            raw_path.write_bytes(content)
             out_path = PROCESSED_DIR / f"{ds.service_name}.csv"
             wide.to_csv(out_path, sep=";", index=False, encoding="utf-8-sig")
             log.info("%s : traite -> %s, colonnes %s", ds.service_name, out_path, list(wide.columns))
@@ -160,11 +161,18 @@ def main() -> int:
                 "years": [int(wide["annee"].min()), int(wide["annee"].max())],
                 "loaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
+            built[ds.key] = wide
         except Exception:
-            failures += 1
-            log.exception("Echec de %s (%s)", ds.key, ds.data_name)
+            log.exception("Echec de %s (%s) : ancien CSV conserve", ds.key, ds.data_name)
 
     MANIFEST.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return built
+
+
+def main() -> int:
+    cfg = read_config()
+    built = build_all(cfg)
+    failures = len(get_datasets(cfg)) - len(built)
     log.info("Termine : %d echec(s). CSV dans %s", failures, PROCESSED_DIR)
     return 1 if failures else 0
 
