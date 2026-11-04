@@ -1,0 +1,43 @@
+; Modele de configuration.
+; Copier ce fichier en config.ini puis le remplir.
+; config.ini contient le mot de passe : il est exclu du depot (.gitignore).
+
+[ODS_ACCESS]
+portal_url=https://data.seineouest.fr
+prefix=/api/explore/v2.1/catalog/datasets/
+; export CSV : noms techniques des champs (use_labels=false), separateur ;
+sufix=/exports/csv?lang=fr&timezone=Europe/Paris&delimiter=%3B&use_labels=false
+; cle API ODS (vide pour les jeux publics) : ajoutee automatiquement aux URL
+apikey=
+
+[ARCGIS_ACCESS]
+; URL de connexion (agnostique Portal / ArcGIS Online) :
+;   ArcGIS Online : https://<org>.maps.arcgis.com/
+;   Portal        : https://<serveur>/portal
+url=https://atlas-sig.seineouest.fr/portal/
+username=
+; vide = lu dans la variable d'environnement ARCGIS_PASSWORD, sinon demande au lancement
+password=
+; false si le certificat du portail n'est pas reconnu par Python
+verify_cert=true
+; dossier de contenu du portail ou ranger les elements
+folder=Hyperviseur_bus
+; partage des tables : everyone | org | private
+sharing=everyone
+tags=GPSO,bus,hyperviseur,opendata
+
+; Une section DATASET_<NOM> par jeu ODS a publier.
+; layer_url est rempli automatiquement par bootstrap.py apres publication
+; (URL de la table : .../FeatureServer/<index>). Rempli = deja publie, bootstrap le saute.
+
+[DATASET_FREQUENTATION]
+data_name=frequentation-des-lignes-de-bus-locaux-depuis-2014
+service_name=bus_frequentation_lignes
+title=Frequentation des lignes de bus locaux depuis 2014
+layer_url=
+
+[DATASET_TAUX_REALISATION]
+data_name=taux-de-realisation-des-lignes-de-bus-locaux-depuis-2014
+service_name=bus_taux_realisation_lignes
+title=Taux de realisation des lignes de bus locaux depuis 2014
+layer_url=
