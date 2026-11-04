@@ -1,28 +1,29 @@
 """
-load_data.py - Chargement des donnees "lignes de bus locaux" depuis data.seineouest.fr.
+load_data.py - Chargement des jeux "lignes de bus locaux" depuis data.seineouest.fr.
 
-Constitue le bootstrap des donnees, en local, avant toute publication SIG.
+Tous les parametres (URL ODS, cle API, jeux a charger) sont dans config.ini.
 Aucune transformation : les donnees sont recuperees telles que publiees sur ODS.
 
-A lancer avec le Python d'ArcGIS Pro (pandas et requests deja embarques) :
-    "C:\\Program Files\\ArcGIS\\Pro\\bin\\Python\\scripts\\propy.bat" load_data.py
-    ... load_data.py --force     # retelecharge meme si ODS n'a pas change
+Usage (Python d'ArcGIS Pro) :
+    python load_data.py            # ne retelecharge que les jeux modifies sur ODS
+    python load_data.py --force    # retelecharge tout
 
-Pour chaque jeu :
+Pour chaque section DATASET_... de config.ini :
   1. lit les metadonnees ODS (titre, date de modification, nombre de lignes, champs) ;
   2. saute le jeu si la date de modification ODS n'a pas change depuis le dernier chargement ;
-  3. telecharge l'export CSV complet (noms de champs techniques : use_labels=false) ;
-  4. controle le fichier avec pandas (non vide, colonnes attendues, nombre de lignes) ;
+  3. telecharge l'export CSV ;
+  4. controle le fichier (non vide, colonnes attendues, nombre de lignes) ;
   5. ecrit :
-       data/raw/<service>.csv       le CSV tel que recu d'ODS
-       data/schema/<service>.json   les champs ODS et le type Esri correspondant
-       data/manifest.json           l'etat du dernier chargement (date ODS, nb lignes, sha256)
+       data/raw/<service_name>.csv      le CSV tel que recu d'ODS
+       data/schema/<service_name>.json  les champs ODS et le type Esri correspondant
+       data/manifest.json               l'etat du dernier chargement
 """
+from __future__ import annotations
+
 import argparse
 import hashlib
 import io
 import json
-import logging
 import sys
 import time
 from datetime import datetime, timezone
@@ -31,17 +32,14 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-# --- Parametres ---------------------------------------------------------------
-ODS_BASE = "https://data.seineouest.fr/api/explore/v2.1/catalog/datasets"
-EXPORT_PARAMS = {"delimiter": ";", "use_labels": "false", "lang": "fr", "timezone": "Europe/Paris"}
+from src.get_configs import ROOT, Dataset, get_datasets, ods_urls, read_config
+from src.logger import get_logger
 
-DATASETS = {
-    # dataset_id ODS : nom du service (= nom du fichier local, puis de la table SIG)
-    "frequentation-des-lignes-de-bus-locaux-depuis-2014": "bus_frequentation_lignes",
-    "taux-de-realisation-des-lignes-de-bus-locaux-depuis-2014": "bus_taux_realisation_lignes",
-}
+RAW_DIR = ROOT / "data" / "raw"
+SCHEMA_DIR = ROOT / "data" / "schema"
+MANIFEST = ROOT / "data" / "manifest.json"
 
-# Correspondance des types ODS vers les types de champs Esri (pour la publication)
+# Types ODS -> types de champs Esri (pour la publication)
 ODS_TO_ESRI = {
     "text": "esriFieldTypeString",
     "int": "esriFieldTypeInteger",
@@ -49,40 +47,19 @@ ODS_TO_ESRI = {
     "date": "esriFieldTypeDate",
     "datetime": "esriFieldTypeDate",
     "boolean": "esriFieldTypeSmallInteger",
-    "geo_point_2d": "esriFieldTypeString",
-    "geo_shape": "esriFieldTypeString",
-    "file": "esriFieldTypeString",
 }
 
-ROOT = Path(__file__).resolve().parent
-RAW_DIR = ROOT / "data" / "raw"
-SCHEMA_DIR = ROOT / "data" / "schema"
-MANIFEST = ROOT / "data" / "manifest.json"
-LOG_DIR = ROOT / "logs"
-
-for d in (RAW_DIR, SCHEMA_DIR, LOG_DIR):
-    d.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "load_data.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("load_data")
-
+log = get_logger("load_data")
 session = requests.Session()
 session.headers.update({"User-Agent": "GPSO-DIGIT automatisation-bdd-ligne-bus"})
 
 
 # --- Utilitaires --------------------------------------------------------------
-def get(url: str, params: dict | None = None, retries: int = 3, timeout: int = 120) -> requests.Response:
-    """GET avec quelques nouvelles tentatives (ODS renvoie parfois des 5xx passagers)."""
+def http_get(url: str, retries: int = 3, timeout: int = 120) -> requests.Response:
+    """GET avec nouvelles tentatives (ODS renvoie parfois des 5xx passagers)."""
     for attempt in range(1, retries + 1):
         try:
-            r = session.get(url, params=params, timeout=timeout)
+            r = session.get(url, timeout=timeout)
             r.raise_for_status()
             return r
         except requests.RequestException as exc:
@@ -101,9 +78,8 @@ def save_manifest(manifest: dict) -> None:
 
 
 # --- Etapes -------------------------------------------------------------------
-def fetch_metadata(dataset_id: str) -> dict:
-    """Metadonnees ODS : titre, date de modification, nombre de lignes, champs."""
-    meta = get(f"{ODS_BASE}/{dataset_id}").json()
+def fetch_metadata(meta_url: str) -> dict:
+    meta = http_get(meta_url).json()
     default = meta.get("metas", {}).get("default", {})
     return {
         "title": default.get("title"),
@@ -121,23 +97,17 @@ def fetch_metadata(dataset_id: str) -> dict:
     }
 
 
-def download_csv(dataset_id: str) -> bytes:
-    content = get(f"{ODS_BASE}/{dataset_id}/exports/csv", params=EXPORT_PARAMS, timeout=300).content
-    if not content.strip():
-        raise ValueError("export CSV vide")
-    return content
-
-
 def check_csv(content: bytes, meta: dict) -> pd.DataFrame:
     """Controles simples, sans rien modifier au fichier."""
+    if not content.strip():
+        raise ValueError("export CSV vide")
     df = pd.read_csv(io.BytesIO(content), sep=";", encoding="utf-8-sig")
     if df.empty:
         raise ValueError("le CSV ne contient aucune ligne")
 
-    expected = [f["name"] for f in meta["fields"]]
-    missing = [c for c in expected if c not in df.columns]
+    missing = [f["name"] for f in meta["fields"] if f["name"] not in df.columns]
     if missing:
-        raise ValueError(f"colonnes absentes du CSV : {missing}")
+        raise ValueError(f"colonnes absentes du CSV : {missing} (verifier use_labels=false dans sufix)")
 
     if meta["records_count"] is not None and len(df) != meta["records_count"]:
         log.warning("Nombre de lignes : %d dans le CSV, %d annonce par ODS", len(df), meta["records_count"])
@@ -145,33 +115,34 @@ def check_csv(content: bytes, meta: dict) -> pd.DataFrame:
 
 
 def describe(service: str, df: pd.DataFrame) -> None:
-    """Apercu dans le log, pour fixer le schema a la premiere execution."""
+    """Apercu des colonnes dans le journal, pour fixer le schema."""
     log.info("%s : %d lignes x %d colonnes", service, len(df), len(df.columns))
     for col in df.columns:
         sample = df[col].dropna().unique()[:5].tolist()
         log.info("   - %-30s %-8s %4d valeurs distinctes, ex. %s", col, str(df[col].dtype), df[col].nunique(), sample)
 
 
-def load_dataset(dataset_id: str, service: str, manifest: dict, force: bool) -> None:
-    meta = fetch_metadata(dataset_id)
-    previous = manifest.get(dataset_id, {})
-    csv_path = RAW_DIR / f"{service}.csv"
+def load_dataset(cfg, ds: Dataset, manifest: dict, force: bool) -> Path:
+    meta_url, export_url = ods_urls(cfg, ds.data_name)
+    meta = fetch_metadata(meta_url)
+    previous = manifest.get(ds.data_name, {})
+    csv_path = RAW_DIR / f"{ds.service_name}.csv"
 
     if not force and csv_path.exists() and previous.get("ods_modified") == meta["modified"]:
-        log.info("%s : inchange sur ODS depuis %s, rien a faire.", service, meta["modified"])
-        return
+        log.info("%s : inchange sur ODS depuis %s, rien a faire.", ds.service_name, meta["modified"])
+        return csv_path
 
-    content = download_csv(dataset_id)
+    content = http_get(export_url, timeout=300).content
     df = check_csv(content, meta)
-    describe(service, df)
+    describe(ds.service_name, df)
 
     csv_path.write_bytes(content)
-    (SCHEMA_DIR / f"{service}.json").write_text(
-        json.dumps({"dataset_id": dataset_id, "title": meta["title"], "fields": meta["fields"]}, indent=2, ensure_ascii=False),
+    (SCHEMA_DIR / f"{ds.service_name}.json").write_text(
+        json.dumps({"data_name": ds.data_name, "title": meta["title"], "fields": meta["fields"]}, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    manifest[dataset_id] = {
-        "service": service,
+    manifest[ds.data_name] = {
+        "service": ds.service_name,
         "title": meta["title"],
         "ods_modified": meta["modified"],
         "records": len(df),
@@ -180,7 +151,23 @@ def load_dataset(dataset_id: str, service: str, manifest: dict, force: bool) -> 
         "file": str(csv_path.relative_to(ROOT)),
         "loaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    log.info("%s : ecrit dans %s", service, csv_path)
+    log.info("%s : ecrit dans %s", ds.service_name, csv_path)
+    return csv_path
+
+
+def load_all(cfg, force: bool = False) -> dict[str, Path]:
+    """Charge tous les jeux de config.ini. Renvoie {section: chemin du CSV} pour ceux qui ont reussi."""
+    for d in (RAW_DIR, SCHEMA_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    manifest = load_manifest()
+    paths = {}
+    for ds in get_datasets(cfg):
+        try:
+            paths[ds.key] = load_dataset(cfg, ds, manifest, force)
+        except Exception:
+            log.exception("Echec du chargement de %s (%s)", ds.key, ds.data_name)
+    save_manifest(manifest)
+    return paths
 
 
 # --- Main ---------------------------------------------------------------------
@@ -189,17 +176,11 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="retelecharger meme si ODS n'a pas change")
     args = parser.parse_args()
 
-    manifest = load_manifest()
-    failures = 0
-    for dataset_id, service in DATASETS.items():
-        try:
-            load_dataset(dataset_id, service, manifest, args.force)
-        except Exception:
-            failures += 1
-            log.exception("Echec du chargement de %s", dataset_id)
-
-    save_manifest(manifest)
-    log.info("Termine : %d jeu(x) en echec sur %d. Etat dans %s", failures, len(DATASETS), MANIFEST)
+    cfg = read_config()
+    total = len(get_datasets(cfg))
+    paths = load_all(cfg, args.force)
+    failures = total - len(paths)
+    log.info("Termine : %d jeu(x) en echec sur %d. Etat dans %s", failures, total, MANIFEST)
     return 1 if failures else 0
 
 
